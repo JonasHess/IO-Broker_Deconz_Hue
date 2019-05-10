@@ -5,7 +5,77 @@ var createState = createState;
 var getState = getState;
 var on = on;
 var getAstroDate = getAstroDate;
+var setTimeout = setTimeout;
+var $ = $;
 //--------------------------------------------
+
+enum DayTimeMoment {
+    /* The strings are used (in combination with the room name) to find scenes from the Phillip's Hue app */
+    Morning = "M",
+    DayLight = "D",
+    Evening = "E",
+    Night = "N"
+}
+
+class TimeOfDay {
+    private minutesSinceMidnight:number;
+
+    constructor (
+        hour:number,
+        minute:number
+    ){
+        this.minutesSinceMidnight = hour * 60 + minute;
+    }
+
+    public static fromDate(date:Date):TimeOfDay {
+        return new TimeOfDay(date.getHours(), date.getMinutes());
+    }
+
+    public addMinutes(minutes:number):TimeOfDay {
+        this.minutesSinceMidnight += minutes;
+        return this;
+    }
+
+    public isBefore(timeOfDay: TimeOfDay): boolean {
+        return this.minutesSinceMidnight < timeOfDay.minutesSinceMidnight;
+    }
+}
+
+
+class DayTimePeriod {
+    constructor(
+        public id:DayTimeMoment,
+        public startsAt: TimeOfDay
+    ){}
+}
+
+function getDayTimePeriods(): DayTimePeriod[] {
+
+    const dawn: Date = getAstroDate("dawn");
+    const goldenHourEnd: Date = getAstroDate("goldenHourEnd");
+    const solarNoon: Date = getAstroDate("solarNoon");
+    const sunsetStart: Date = getAstroDate("sunsetStart");
+    const night: Date = getAstroDate("night");
+
+    return [
+        {
+            "id" : DayTimeMoment.Morning,
+            "startsAt": new TimeOfDay(5,0)
+        },
+        {
+            "id" : DayTimeMoment.DayLight,
+            "startsAt": TimeOfDay.fromDate(goldenHourEnd)
+        },
+        {
+            "id" : DayTimeMoment.Evening,
+            "startsAt": TimeOfDay.fromDate(sunsetStart).addMinutes(-20)
+        },
+        {
+            "id" : DayTimeMoment.Night,
+            "startsAt": new TimeOfDay(23,0)
+        },
+    ]
+}
 
 class RoomLock {
     constructor(
@@ -49,25 +119,29 @@ class RoomLock {
     }
 }
 
-function registerHueDimmerButtonEvents(dimmerName:string, dimmerObjectID:string, buttonActions):void {
+
+
+
+
+function registerHueDimmerButtonEvents(context:ActionContext, dimmerName:string, dimmerObjectID:string, dimmerSwitchLayout:DimmerSwitchLayout):void {
     on({id: dimmerObjectID, change: "ne"}, function (obj) {
 
-        const buttonEventId: number = obj.state.val;
-        const buttonActionsArray = buttonActions[buttonEventId];
+        const clickedButtonEventId: number = obj.state.val;
 
-        if (!buttonActionsArray){
+        let buttonActions: DimmerSwitchButtonEventActions = dimmerSwitchLayout.getButtonEventActionsForEventId(clickedButtonEventId);
+        if (buttonActions == null) {
             return;
         }
-        if (buttonActionsArray.length == 0) {
-            return
+        if (buttonActions.buttonActions.length == 0){
+            return;
         }
 
         // 1004 becomes 1000
-        const buttonId: number = Math.floor((buttonEventId / 1000)) * 1000;
+        const buttonId: number = Math.floor((clickedButtonEventId / 1000)) * 1000;
 
         const rootStatePath:string = "Sensors.HueDimmer";
         const statePathLastClickedButtonId: string = rootStatePath + "." + dimmerName + "." + "LastClickedButtonId";
-        const statePathDoubleClickHistory: string = rootStatePath + "." + dimmerName + "." + buttonEventId;
+        const statePathDoubleClickHistory: string = rootStatePath + "." + dimmerName + "." + clickedButtonEventId;
 
 
         createState(statePathDoubleClickHistory, "{\"History\" : []}", () => {
@@ -77,7 +151,7 @@ function registerHueDimmerButtonEvents(dimmerName:string, dimmerObjectID:string,
                 setState(statePathLastClickedButtonId, buttonId);
 
                 const doubleClickHistory = JSON.parse(getState(statePathDoubleClickHistory).val);
-                if (! (lastClickedButtonId == buttonId)) {
+                if (lastClickedButtonId !== buttonId) {
                     // Forget history if different button was pressed earlier
                     doubleClickHistory.History = [];
                 }
@@ -90,7 +164,7 @@ function registerHueDimmerButtonEvents(dimmerName:string, dimmerObjectID:string,
                     }
                 }
 
-                if (doubleClickHistory.History.length >= buttonActionsArray.length) {
+                if (doubleClickHistory.History.length >= buttonActions.buttonActions.length) {
                     // Reset cycle on too many presses
                     doubleClickHistory.History = [];
                 }
@@ -100,8 +174,8 @@ function registerHueDimmerButtonEvents(dimmerName:string, dimmerObjectID:string,
 
                 // Execute the button Action
                 const clickCounter: number = doubleClickHistory.History.length - 1;
-                const buttonAction = buttonActionsArray[clickCounter];
-                buttonAction.buttonAction();
+                const buttonAction = buttonActions.buttonActions[clickCounter];
+                buttonAction.action(context);
 
                 // Prevent Motionsensors from overwriting the just set scene.
                 const motionSensorOverwrites = buttonAction.motionSensorOverwrites;
@@ -109,9 +183,10 @@ function registerHueDimmerButtonEvents(dimmerName:string, dimmerObjectID:string,
                     for (let i = 0; i < motionSensorOverwrites.length; i++) {
                         const room: string = motionSensorOverwrites[i].room;
                         const durationInMs: number = motionSensorOverwrites[i].durationInMs;
+                        let lockedUntil = Date.now() + durationInMs;
 
                         RoomLock.createRoomLockStateIfNotExist(room, () => {
-                            let lock = new RoomLock(dimmerName, true, durationInMs, 0);
+                            let lock = new RoomLock(dimmerName, true, lockedUntil , 0);
                             lock.saveToState(room);
                             console.log("Setting motionSensorOverwrites for room " + room + " duration: " + durationInMs);
                         })
@@ -134,7 +209,7 @@ function registerHueSensorMotionEvent(sensorId: string, lockname: string, roomna
             console.log(lockname + " Event incoming,  motionDetected: " + motionDetected);
 
             const timeOfDayMotionAction = getMotionActionMatchingTimeOfDay(motionActions);
-            if (!timeOfDayMotionAction) {
+            if (timeOfDayMotionAction == null) {
                 console.log(lockname + " No motionAction found for this time of day");
                 return;
             }
@@ -161,7 +236,7 @@ function registerHueSensorMotionEvent(sensorId: string, lockname: string, roomna
                             console.log(lockname + " Delayed:  not the lock owner");
                             return;
                         }
-                        if (! (RoomLock.loadFromState(roomname).turnOffId == turnOffId)) {
+                        if (RoomLock.loadFromState(roomname).turnOffId !== turnOffId) {
                             console.log(lockname + " Delayed:  incorrect turnOffId");
                             return;
                         }
@@ -202,9 +277,10 @@ function getMotionActionMatchingTimeOfDay(motionActions: MotionSensorActionBook)
 }
 
 function getCurrentDayTimePeriodId():DayTimeMoment {
-    const currentTime:TimeOfDay = TimeOfDay.fromDate(new Date())
+    let date:Date = new Date(Date.now());
+    let currentTime:TimeOfDay = TimeOfDay.fromDate(date);
 
-    const dayTimePeriods = getDayTimePeriods();
+    let dayTimePeriods = getDayTimePeriods();
 
     let lastP = dayTimePeriods[dayTimePeriods.length - 1];
     for (let i = 0; i < dayTimePeriods.length; i++) {
@@ -227,70 +303,8 @@ function registerHueSensorCoupleMotionEvents(room, noMotionDelay, sensors: Motio
     }
 }
 
-class TimeOfDay {
-    private minutes:number;
 
-    constructor (
-      hour:number,
-      minute:number
-    ){
-      this.minutes = hour * 60 + minute;
-    }
 
-    public static fromDate(date:Date):TimeOfDay {
-        return new TimeOfDay(date.getHours(), date.getMinutes());
-    }
-
-    public addMinutes(minutes:number):TimeOfDay {
-        this.minutes += minutes;
-        return this;
-    }
-
-    public isBefore(timeOfDay: TimeOfDay): boolean {
-        return this.minutes < timeOfDay.minutes;
-    }
-}
-
-enum DayTimeMoment {
-    Morgen,
-    Mittag,
-    Abend,
-    Nacht
-}
-
-class DayTimePeriod {
-    constructor(
-        public id:DayTimeMoment,
-        public startsAt: TimeOfDay
-    ){}
-}
-function getDayTimePeriods(): DayTimePeriod[] {
-
-    const dawn: Date = getAstroDate("dawn");
-    const goldenHourEnd: Date = getAstroDate("goldenHourEnd");
-    const solarNoon: Date = getAstroDate("solarNoon");
-    const sunsetStart: Date = getAstroDate("sunsetStart");
-    const night: Date = getAstroDate("night");
-
-    return [
-        {
-            "id" : DayTimeMoment.Morgen,
-            "startsAt": new TimeOfDay(5,0)
-        },
-        {
-            "id" : DayTimeMoment.Mittag,
-            "startsAt": TimeOfDay.fromDate(goldenHourEnd)
-        },
-        {
-            "id" : DayTimeMoment.Abend,
-            "startsAt": TimeOfDay.fromDate(sunsetStart).addMinutes(-20)
-        },
-        {
-            "id" : DayTimeMoment.Nacht,
-            "startsAt": new TimeOfDay(23,0)
-        },
-    ]
-}
 
 class MotionSensor {
     constructor (
@@ -317,8 +331,8 @@ class MotionSensorActionBook {
 
 class RoomLockOverwriteInfo {
     constructor(
-       public room:string,
-       public durationInMs:number
+        public room:string,
+        public durationInMs:number
     ) {}
 
 }
@@ -333,13 +347,29 @@ class DimmerSwitchLayout {
     constructor(
         public buttonLayout: DimmerSwitchButtonEventActions[]
     ){}
+
+    public getButtonEventActionsForEventId(eventId:number):DimmerSwitchButtonEventActions {
+        for (let x of this.buttonLayout.filter((v, i ,a) => {
+            return v.getEventIdAsNumber() == eventId;
+        })) {
+            return x;
+        }
+        return null;
+    }
 }
 
 class DimmerSwitchButtonEventActions {
     constructor(
-      public eventId:HueDimmerButtonEvents,
-      public buttonActions:ButtonAction[]
+        public eventId:HueDimmerButtonEvents,
+        public buttonActions:ButtonAction[]
     ){}
+
+    public getEventIdAsNumber():number {
+        return HueDimmerButtonEvents[HueDimmerButtonEvents[this.eventId]];
+    }
+
+
+
 }
 enum HueDimmerButtonEvents {
     ON_BUTTON_DOWN = 1000,
@@ -359,44 +389,18 @@ enum HueDimmerButtonEvents {
     OFF_BUTTON_LONG = 4003
 }
 
-
-function getDefaultDimmerSwitchButtonActions(): DimmerSwitchLayout {
-    return {
-        buttonLayout: [
-            {
-                eventId: HueDimmerButtonEvents.ON_BUTTON_UP,
-                buttonActions: [
-                    {
-                        motionSensorOverwrites: [
-                            {
-                                room: "Wohnzimmer",
-                                durationInMs:12
-                            }
-                        ],
-                        action:() => {
-                            console.log("ON Button Down Singlepress");
-                            setState('hue.0.Hue_01.Wohnzimmer.bri', 254);
-                        }
-                    }
-                ]
-            }
-        ]
-    }
-}
-
-
 class RoomConfig {
 
     constructor(
-       public roomname: Room,
-       public noMotionDelay: number,
-       public hueRoomBrightnessObjectId,
-       public hueScenes: HueScene[],
-       public motionScenes: MotionSceneConfig[],
-       public motionSensors: MotionSensor[],
-       public dimmerSwitches: DimmerSwitch[],
-       public defaultRoomActionsProvider: ()=>RoomAction[],
-       public roomActions: RoomAction[]
+        public roomname: Room,
+        public noMotionDelay: number,
+        public hueRoomBrightnessObjectId,
+        public hueScenes: HueScene[],
+        public motionScenes: MotionSceneConfig[],
+        public motionSensors: MotionSensor[],
+        public dimmerSwitches: DimmerSwitch[],
+        public defaultRoomActionsProvider: RoomAction[],
+        public roomActions: RoomAction[]
     ){}
 
     public runRoomActionOfType(actionType: RoomActionType, context: ActionContext):void {
@@ -406,25 +410,26 @@ class RoomConfig {
     }
 
     private getRoomActionsOfType(actionType: RoomActionType, callback:(roomAction: RoomAction)=>void): RoomAction {
-        let result: RoomAction = null;
-        let filtered = this.roomActions.filter((value, index, array) => {
-            return value.actionName == actionType;
-        });
-        if (filtered.length > 1) {
-            console.error("Too many RoomActions of type: " + actionType.toString() + " in RoomConfig of + " + this.roomname);
-        } else if (filtered.length = 0) {
-            let defaultActions = this.defaultRoomActionsProvider().filter((value, index, array) => {
-                return value.actionName == actionType;
-            });
-            for (let defaultAction of defaultActions) {
-                // Not a loop
-                result = defaultAction;
-                break;
+
+        let findInArray = function(actionArray:RoomAction[], actionToSearch: RoomActionType):RoomAction {
+
+            for (let action of actionArray) {
+                if (action.actionName === actionToSearch) {
+                    return action;
+                }
             }
-        } else {
-            result = filtered[0];
+            return null;
+        };
+
+        let result = findInArray(this.roomActions, actionType);
+
+        if (result == null) {
+            result = findInArray(this.defaultRoomActionsProvider, actionType);
         }
-        if (result != null) {
+
+        console.log("result: " + result);
+        if (result !== null) {
+            console.log("Action was found -- calling callback");
             callback(result);
         }
         return result;
@@ -461,119 +466,18 @@ class ActionContext {
 
 class DimmerSwitch {
     constructor(
-      public  switchName:string,
-      public buttonEventObjectId:string,
-      public getButtonLayout:(context:ActionContext)=>DimmerSwitchLayout
+        public  switchName:string,
+        public buttonEventObjectId:string,
+        public getButtonLayout:(context:ActionContext)=>DimmerSwitchLayout
     ){}
 }
 
-function getLayout01(context:ActionContext, longOffTurnsHouseOff: boolean):DimmerSwitchLayout {
-    let motionSensorOverwrite = (duration:number ) => {
-        return  [
-                    new RoomLockOverwriteInfo(context.roomConfig.roomname, duration)
-                ];
-    };
-    let defaultOverwrite: number = 2 * 60 * 60 * 1000;
 
-    let setBrightness = (brightness: number) => {
-        return new ButtonAction(
-            motionSensorOverwrite(defaultOverwrite),
-            (context) => {
-                context.brightness = brightness;
-                context.roomConfig.runRoomActionOfType(RoomActionType.regulateBrightnes, context);
-            }
-        )
-    };
-
-
-    return new DimmerSwitchLayout([
-        new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.ON_BUTTON_UP,(()=>{
-            let x = [];
-            for (let i = 0; i < context.roomConfig.hueScenes.length; i++) {
-                x.push(
-                    new ButtonAction(
-                        motionSensorOverwrite(defaultOverwrite),
-                        (context) => {
-                            context.sceneIndex = i;
-                            context.roomConfig.runRoomActionOfType(RoomActionType.activateScene, context);
-                        }
-                    )
-                );
-            }
-            return x;
-        })()),
-        new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.DARKER_BUTTON_DOWN, [
-            setBrightness(125),
-            setBrightness(100),
-            setBrightness(75),
-            setBrightness(50),
-            setBrightness(25),
-            setBrightness(20),
-            setBrightness(15),
-            setBrightness(10),
-            setBrightness(5),
-            setBrightness(5),
-            setBrightness(5),
-            setBrightness(5),
-
-        ]),
-        new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.BRIGHTER_BUTTON_UP, [
-            setBrightness(150),
-            setBrightness(175),
-            setBrightness(200),
-            setBrightness(225),
-            setBrightness(254),
-            setBrightness(254),
-            setBrightness(254),
-        ]),
-        new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.DARKER_BUTTON_LONG, [
-            new ButtonAction(
-                [],
-                (contect) => {
-                    contect.roomConfig.runRoomActionOfType(RoomActionType.ventilationOn, contect);
-                }
-            ),
-            new ButtonAction(
-                [],
-                (context) => {
-                    context.roomConfig.runRoomActionOfType(RoomActionType.ventilationOff, context);
-                }
-            )
-        ]),
-        new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.OFF_BUTTON_UP, [
-            new ButtonAction(
-                motionSensorOverwrite(3000),
-                (context) => {
-                    context.roomConfig.runRoomActionOfType(RoomActionType.turnLightsOff, context);
-                }
-            )
-        ]),
-        new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.OFF_BUTTON_LONG, [
-            new ButtonAction(
-                motionSensorOverwrite(3000),
-                (context) => {
-                    if (longOffTurnsHouseOff) {
-                        context.houseConfig.turnHouseOff(context);
-                    } else {
-                        context.roomConfig.runRoomActionOfType(RoomActionType.roomOff, context);
-                    }
-
-                }
-            ),
-            new ButtonAction(
-                motionSensorOverwrite(3000),
-                (context) => {
-                    context.houseConfig.turnHouseOff(context);
-                }
-            )
-        ]),
-    ]);
-}
 
 class RoomAction {
     constructor(
-       public actionName: RoomActionType,
-       public action:(context:ActionContext)=>void
+        public actionName: RoomActionType,
+        public action:(context:ActionContext)=>void
     ){}
 }
 
@@ -629,7 +533,9 @@ function getDefaultRoomActions():RoomAction[] {
                     return;
                 }
                 let wantedSceneIndex = context.sceneIndex % scenes.length; //TODO off by one?
-                scenes[wantedSceneIndex].activateScene();
+                context.sceneIndex = wantedSceneIndex;
+                console.log("activating scene index: " + wantedSceneIndex);
+                scenes[wantedSceneIndex].activateScene(context);
             }
         },
         {
@@ -652,7 +558,7 @@ function getDefaultRoomActions():RoomAction[] {
             actionName: RoomActionType.onMotion,
             action: context => {
                 let motionScene = context.roomConfig.motionScenes[context.sceneIndex];
-                motionScene.hueScene.activateScene();
+                motionScene.hueScene.activateScene(context);
                 if (motionScene.activateRadio) {
                     context.roomConfig.runRoomActionOfType(RoomActionType.musicOn, context);
                 }
@@ -661,15 +567,69 @@ function getDefaultRoomActions():RoomAction[] {
     ];
 }
 
+
 class HueScene{
     constructor(
-        private sceneObjectId:string
+        protected action:(contex:ActionContext)=>void
     ){}
 
-    public activateScene():void {
-        setState(this.sceneObjectId, 1);
+    public activateScene(contex:ActionContext):void {
+        this.action(contex);
     }
 }
+
+abstract class AutoWiredHueScene extends HueScene{
+    constructor(
+        protected action:(contex:ActionContext)=>void
+    ) {
+        super(action);
+    }
+
+    protected getHueSceneObjectIds(room: Room, sceneName: string, callBack:(id, index)=>any) {
+        const sceneNamespace = "javascript.0.PhilipsHue.Scenes";
+
+        let roomName:string = room;
+        let searchname = sceneNamespace + "." + roomName + "." + sceneName;
+        console.log("searching for name " + searchname );
+
+        let cacheSelectorallefalse = $("[id=" + searchname + ".*]");
+        cacheSelectorallefalse.each(callBack);
+    }
+}
+
+class AutowiredButtonHueScene extends AutoWiredHueScene{
+    constructor(){
+        super((context: ActionContext) => {
+            this.getHueSceneObjectIdsSceneIndex(context.roomConfig.roomname, context.sceneIndex, (id, index)=> {
+                console.log("Activating scene:" + id);
+                setState(id, true);
+            });
+        });
+    }
+
+    private getHueSceneObjectIdsSceneIndex(room: Room, sceneIndex:number, callBack:(id, index)=>any) {
+        let sceneName:string =  "" + (sceneIndex + 1);
+        this.getHueSceneObjectIds(room, sceneName, callBack);
+    }
+}
+
+
+
+class AutowiredMotionScene extends AutoWiredHueScene{
+    constructor(
+    ){
+        super((context: ActionContext) => {
+            this.getHueSceneObjectIdsDayTime(context.roomConfig.roomname, context.dayTime, (id:number, index:number)=> {
+                setState(id, true);
+            });
+        });
+    }
+    private getHueSceneObjectIdsDayTime(room: Room, dayTimeMoment:DayTimeMoment, callBack:(id, index)=>any) {
+        let sceneName:string =  dayTimeMoment;
+        this.getHueSceneObjectIds(room, sceneName, callBack);
+    }
+}
+
 
 
 
@@ -679,11 +639,8 @@ function registerHouseConfig(houseConfig: HouseConfig) {
             let context = new ActionContext(houseConfig, roomConfig, dimmerSwitch.switchName);
             let dimmerSwitchLayout = dimmerSwitch.getButtonLayout(context);
 
-            for (let buttonLayout of dimmerSwitchLayout.buttonLayout) {
-                for (let buttonAction of buttonLayout.buttonActions) {
-                    registerHueDimmerButtonEvents(dimmerSwitch.switchName, HueDimmerButtonEvents[buttonLayout.eventId], buttonAction);
-                }
-            }
+            registerHueDimmerButtonEvents(context, dimmerSwitch.switchName, dimmerSwitch.buttonEventObjectId, dimmerSwitchLayout);
+
         }
 
         if (roomConfig.motionSensors.length > 0) {
@@ -727,62 +684,282 @@ class MotionSceneConfig {
     ) {}
 }
 
-(function main():void {
-    registerHouseConfig(new HouseConfig([
-            new RoomConfig(
-                Room.Wohnzimmer,
-                5*60*1000,
-                "wohnzimmer123.x.y.z",
-                [
-                    new HueScene("MySpecialHueSceneObjectId"),
-                    new HueScene("MySpecialHueSceneObjectId2"),
-                ],
-                [
-                    new MotionSceneConfig(
-                        DayTimeMoment.Morgen,
-                        false,
-                        new HueScene("MySpecialMotionHueSceneObjectId")
-                    ),
-                    new MotionSceneConfig(
-                        DayTimeMoment.Mittag,
-                        false,
-                        new HueScene("MySpecialMotionHueSceneObjectId")
-                    ),
-                    new MotionSceneConfig(
-                        DayTimeMoment.Abend,
-                        false,
-                        new HueScene("MySpecialMotionHueSceneObjectId")
-                    ),
-                    new MotionSceneConfig(
-                        DayTimeMoment.Nacht,
-                        false,
-                        new HueScene("MySpecialMotionHueSceneObjectId")
-                    )
-                ],
-                [
-                    {
-                        sensorName: "sensorXY",
-                        presensEventObjectId: "object.x.y.z"
+function getDefaultMotionSceneConfigs() {
+    return [
+        new MotionSceneConfig(
+            DayTimeMoment.Morning,
+            false,
+            new AutowiredMotionScene()
+        ),
+        new MotionSceneConfig(
+            DayTimeMoment.DayLight,
+            false,
+            new AutowiredMotionScene()
+        ),
+        new MotionSceneConfig(
+            DayTimeMoment.Evening,
+            false,
+            new AutowiredMotionScene()
+        ),
+        new MotionSceneConfig(
+            DayTimeMoment.Night,
+            false,
+            new AutowiredMotionScene()
+        )
+    ];
+}
+
+function getDefaultHueScenes() {
+    return [
+        new AutowiredButtonHueScene(),
+        new AutowiredButtonHueScene(),
+        new AutowiredButtonHueScene(),
+        new AutowiredButtonHueScene(),
+        new AutowiredButtonHueScene()
+    ];
+}
+
+
+class DefaultRoomConfig extends RoomConfig{
+
+    constructor(
+        roomname: Room,
+        noMotionDelay: number,
+        hueRoomBrightnessObjectId,
+        motionSensors: MotionSensor[],
+        dimmerSwitches: DimmerSwitch[],
+        roomActions: RoomAction[]
+    ) {
+        super(
+            roomname,
+            noMotionDelay,
+            hueRoomBrightnessObjectId,
+            getDefaultHueScenes(),
+            getDefaultMotionSceneConfigs(),
+            motionSensors,
+            dimmerSwitches,
+            (()=>{ return getDefaultRoomActions()})(),
+            roomActions
+        );
+    }
+}
+
+class DefaultDimmerSwitch extends DimmerSwitch{
+
+    constructor(
+        switchName: string,
+        buttonEventObjectId: string,
+        getButtonLayout: (context: ActionContext) => DimmerSwitchLayout) {
+        super(
+            switchName,
+            buttonEventObjectId,
+            getButtonLayout);
+    }
+
+    public static getLayout01(context:ActionContext, offButtonTurnsEntireRoomOff:boolean,  longOffButtonTurnsHouseOff: boolean):DimmerSwitchLayout {
+        let motionSensorOverwrite = (duration:number ) => {
+            return  [
+                new RoomLockOverwriteInfo(context.roomConfig.roomname, duration)
+            ];
+        };
+        let defaultOverwrite: number = 2 * 60 * 60 * 1000;
+
+        let setBrightness = (brightness: number) => {
+            return new ButtonAction(
+                motionSensorOverwrite(defaultOverwrite),
+                (context) => {
+                    console.log("Setting brightness to " + brightness);
+                    context.brightness = brightness;
+                    context.roomConfig.runRoomActionOfType(RoomActionType.regulateBrightnes, context);
+                }
+            )
+        };
+
+
+        return new DimmerSwitchLayout([
+            new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.ON_BUTTON_UP,(()=>{
+                let x = [];
+                for (let i = 0; i < context.roomConfig.hueScenes.length; i++) {
+                    x.push(
+                        new ButtonAction(
+                            motionSensorOverwrite(defaultOverwrite),
+                            (context) => {
+                                console.log("Turning lights on");
+                                context.sceneIndex = i;
+                                context.roomConfig.runRoomActionOfType(RoomActionType.activateScene, context);
+                            }
+                        )
+                    );
+                }
+                return x;
+            })()),
+            new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.DARKER_BUTTON_DOWN, [
+                setBrightness(125),
+                setBrightness(100),
+                setBrightness(75),
+                setBrightness(50),
+                setBrightness(25),
+                setBrightness(20),
+                setBrightness(15),
+                setBrightness(10),
+                setBrightness(5),
+                setBrightness(5),
+                setBrightness(5),
+                setBrightness(5),
+
+            ]),
+            new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.BRIGHTER_BUTTON_UP, [
+                setBrightness(150),
+                setBrightness(175),
+                setBrightness(200),
+                setBrightness(225),
+                setBrightness(254),
+                setBrightness(254),
+                setBrightness(254),
+            ]),
+            new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.DARKER_BUTTON_LONG, [
+                new ButtonAction(
+                    [],
+                    (contect) => {
+                        contect.roomConfig.runRoomActionOfType(RoomActionType.ventilationOn, contect);
                     }
-                ],
-                [
-                    {
-                        switchName: "Switch WZ Couch",
-                        buttonEventObjectId: "buton123.x.y.z",
-                        getButtonLayout: (context) => {return getLayout01(context, false)}
+                ),
+                new ButtonAction(
+                    [],
+                    (context) => {
+                        context.roomConfig.runRoomActionOfType(RoomActionType.ventilationOff, context);
                     }
-                ],
-                ()=>{ return getDefaultRoomActions()},
-                [
-                    {
-                        actionName: RoomActionType.tvOn,
-                        action: context => {
-                            // TODO
+                )
+            ]),
+            new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.OFF_BUTTON_UP, [
+                new ButtonAction(
+                    motionSensorOverwrite(3000),
+                    (context) => {
+                        if (offButtonTurnsEntireRoomOff) {
+                            context.roomConfig.runRoomActionOfType(RoomActionType.roomOff, context);
+                        } else {
+                            context.roomConfig.runRoomActionOfType(RoomActionType.turnLightsOff, context);
                         }
                     }
-                ]
-            )
-        ]
-    )
+                ),
+                new ButtonAction(
+                    motionSensorOverwrite(2 * 60 * 60 * 1000),
+                    (context) => {
+                        console.log("Turning lights off");
+                        context.roomConfig.runRoomActionOfType(RoomActionType.turnLightsOff, context);
+                    }
+                )
+            ]),
+            new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.OFF_BUTTON_LONG, [
+                new ButtonAction(
+                    motionSensorOverwrite(3000),
+                    (context) => {
+                        if (longOffButtonTurnsHouseOff) {
+                            context.houseConfig.turnHouseOff(context);
+                        } else {
+                            context.roomConfig.runRoomActionOfType(RoomActionType.roomOff, context);
+                        }
+
+                    }
+                ),
+                new ButtonAction(
+                    motionSensorOverwrite(3000),
+                    (context) => {
+                        context.houseConfig.turnHouseOff(context);
+                    }
+                )
+            ]),
+        ]);
+    }
+}
+
+
+
+
+function getDimmerSwitchesByName():string {
+    let name = "A8";
+    switch (name) {
+        case "A8": {
+            return "deconz.0.Sensors.20.buttonevent";
+        }
+        case "A3": {
+            return "deconz.0.Sensors.19.buttonevent";
+        }
+        case "A4": {
+            return "deconz.0.Sensors.18.buttonevent";
+        }
+        case "C2": {
+            return "deconz.0.Sensors.17.buttonevent";
+        }
+        case "C9": {
+            return "deconz.0.Sensors.16.buttonevent";
+        }
+        case "C7": {
+            return "deconz.0.Sensors.15.buttonevent";
+        }
+        case "A9": {
+            return "deconz.0.Sensors.14.buttonevent";
+        }
+        case "C6": {
+            return "deconz.0.Sensors.13.buttonevent";
+        }
+        case "A2": {
+            return "deconz.0.Sensors.12.buttonevent";
+        }
+        case "A5": {
+            return "deconz.0.Sensors.11.buttonevent";
+        }
+        case "A6": {
+            return "deconz.0.Sensors.10.buttonevent";
+        }
+        case "A1": {
+            return "deconz.0.Sensors.9.buttonevent";
+        }
+        case "C1": {
+            return "deconz.0.Sensors.8.buttonevent";
+        }
+        case "B1": {
+            return "deconz.0.Sensors.7.buttonevent";
+        }
+        case "A7": {
+            return "deconz.0.Sensors.6.buttonevent";
+        }
+        case "No-Name": {
+            return "deconz.0.Sensors.2.buttonevent";
+        }
+    }
+}
+
+(function main():void {
+    registerHouseConfig(
+        new HouseConfig(
+            [
+                new DefaultRoomConfig(Room.Wohnzimmer,
+                    5000,
+                    'hue.1.Hue_02.Wohnzimmer.bri',
+                    [
+                        {
+                            sensorName: "MotionSensor01",
+                            presensEventObjectId: "deconz.0.Sensors.3.presence"
+                        }
+                    ],
+                    [
+                        new DefaultDimmerSwitch(
+                            "Switch WZ Couch",
+                            getDimmerSwitchesByName(),
+                            (context => DefaultDimmerSwitch.getLayout01(context, false, false))
+                        )
+                    ],
+                    [
+                        {
+                            actionName: RoomActionType.tvOn,
+                            action: context => {
+                                // TODO add tv config
+                            }
+                        }
+                    ]
+                )
+            ]
+        )
     );
 })();
