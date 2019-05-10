@@ -6,6 +6,7 @@ var getState = getState;
 var on = on;
 var getAstroDate = getAstroDate;
 var setTimeout = setTimeout;
+var getObject = getObject;
 var $ = $;
 //--------------------------------------------
 
@@ -16,6 +17,17 @@ enum DayTimeMoment {
     Evening = "E",
     Night = "N"
 }
+
+enum Room {
+    Wohnzimmer = "WZ",
+    Schlafzimmer = "SZ",
+    Flur = "F",
+    Kueche = "K",
+    BadGross = "BZG",
+    BadKlein = "BZK",
+}
+
+
 
 class TimeOfDay {
     private minutesSinceMidnight:number;
@@ -436,10 +448,6 @@ class RoomConfig {
     }
 }
 
-enum Room {
-    Wohnzimmer = "WZ",
-    Schlafzimmer = "SZ"
-}
 
 class HouseConfig {
     constructor(
@@ -724,20 +732,20 @@ class DefaultRoomConfig extends RoomConfig{
 
     constructor(
         roomname: Room,
+        roomNameInHueApp,
         noMotionDelay: number,
-        hueRoomBrightnessObjectId,
-        motionSensors: MotionSensor[],
-        dimmerSwitches: DimmerSwitch[],
+        motionSensors: string[],
+        dimmerSwitches: string[],
         roomActions: RoomAction[]
     ) {
         super(
             roomname,
             noMotionDelay,
-            hueRoomBrightnessObjectId,
+            "hue.1.Hue_02." + roomNameInHueApp + ".bri",
             getDefaultHueScenes(),
             getDefaultMotionSceneConfigs(),
-            motionSensors,
-            dimmerSwitches,
+            DefaultHueMotionScensor.fromList(motionSensors),
+            DefaultDimmerSwitch.fromList(dimmerSwitches),
             (()=>{ return getDefaultRoomActions()})(),
             roomActions
         );
@@ -748,12 +756,19 @@ class DefaultDimmerSwitch extends DimmerSwitch{
 
     constructor(
         switchName: string,
-        buttonEventObjectId: string,
-        getButtonLayout: (context: ActionContext) => DimmerSwitchLayout) {
+        getButtonLayout: (context: ActionContext) => DimmerSwitchLayout = (context => DefaultDimmerSwitch.getLayout01(context, false, false))) {
         super(
             switchName,
-            buttonEventObjectId,
+            getObjectIdByName(switchName),
             getButtonLayout);
+    }
+
+    public static fromList(list:string[]):DefaultDimmerSwitch[] {
+        let result = [];
+        for (let x of list) {
+            result.push( new DefaultDimmerSwitch(x));
+        }
+        return result;
     }
 
     public static getLayout01(context:ActionContext, offButtonTurnsEntireRoomOff:boolean,  longOffButtonTurnsHouseOff: boolean):DimmerSwitchLayout {
@@ -873,91 +888,212 @@ class DefaultDimmerSwitch extends DimmerSwitch{
     }
 }
 
+class DefaultHueMotionScensor extends MotionSensor{
 
+    constructor(
+        sensorName: string
+    ) {
+        super(
+            sensorName,
+            getObjectIdByName(sensorName));
+    }
 
-
-function getDimmerSwitchesByName():string {
-    let name = "A8";
-    switch (name) {
-        case "A8": {
-            return "deconz.0.Sensors.20.buttonevent";
+    public static fromList(list:string[]) {
+        let result = [];
+        for (let x of list) {
+            result.push(new DefaultHueMotionScensor(x))
         }
-        case "A3": {
-            return "deconz.0.Sensors.19.buttonevent";
-        }
-        case "A4": {
-            return "deconz.0.Sensors.18.buttonevent";
-        }
-        case "C2": {
-            return "deconz.0.Sensors.17.buttonevent";
-        }
-        case "C9": {
-            return "deconz.0.Sensors.16.buttonevent";
-        }
-        case "C7": {
-            return "deconz.0.Sensors.15.buttonevent";
-        }
-        case "A9": {
-            return "deconz.0.Sensors.14.buttonevent";
-        }
-        case "C6": {
-            return "deconz.0.Sensors.13.buttonevent";
-        }
-        case "A2": {
-            return "deconz.0.Sensors.12.buttonevent";
-        }
-        case "A5": {
-            return "deconz.0.Sensors.11.buttonevent";
-        }
-        case "A6": {
-            return "deconz.0.Sensors.10.buttonevent";
-        }
-        case "A1": {
-            return "deconz.0.Sensors.9.buttonevent";
-        }
-        case "C1": {
-            return "deconz.0.Sensors.8.buttonevent";
-        }
-        case "B1": {
-            return "deconz.0.Sensors.7.buttonevent";
-        }
-        case "A7": {
-            return "deconz.0.Sensors.6.buttonevent";
-        }
-        case "No-Name": {
-            return "deconz.0.Sensors.2.buttonevent";
-        }
+        return result;
     }
 }
+
+
+
+class DeviceDiscovery {
+
+    private static devices = {};
+    static initialize() {
+        DeviceDiscovery.discoverDevices(
+            DeviceDiscovery.devices,
+            "deconz.0.Sensors.*.presence",
+            "-M"
+        );
+    }
+
+    private static  discoverDevices (returnObject: any ,searchString: string, suffix:string) {
+        let t = "[id=" + searchString + "]";
+        let discoveredIds:any = $(t);
+        for (var id of discoveredIds) {
+            if (! (id)) {
+                continue;
+            }
+            var obj = getObject(id);
+            if (! (obj)) {
+                continue;
+            }
+
+            let commonName:string = obj.common.name;
+            if (! (commonName)) {
+                continue;
+            }
+            let s = commonName.split(" ", 2);
+            if (s.length < 1) {
+                continue;
+            }
+            returnObject[s[0] + suffix] = id;
+        }
+        return returnObject;
+    }
+
+    public static getObjectIdByName(name:string):string {
+        let result = DeviceDiscovery.devices[name];
+        if (result) {
+            return result;
+        }
+        switch (name) {
+            case "A8": {
+                return "deconz.0.Sensors.20.buttonevent";
+            }
+            case "A3": {
+                return "deconz.0.Sensors.19.buttonevent";
+            }
+            case "A4": {
+                return "deconz.0.Sensors.18.buttonevent";
+            }
+            case "C2": {
+                return "deconz.0.Sensors.17.buttonevent";
+            }
+            case "C9": {
+                return "deconz.0.Sensors.16.buttonevent";
+            }
+            case "C7": {
+                return "deconz.0.Sensors.15.buttonevent";
+            }
+            case "A9": {
+                return "deconz.0.Sensors.14.buttonevent";
+            }
+            case "C6": {
+                return "deconz.0.Sensors.13.buttonevent";
+            }
+            case "A2": {
+                return "deconz.0.Sensors.12.buttonevent";
+            }
+            case "A5": {
+                return "deconz.0.Sensors.11.buttonevent";
+            }
+            case "A6": {
+                return "deconz.0.Sensors.10.buttonevent";
+            }
+            case "A1": {
+                return "deconz.0.Sensors.9.buttonevent";
+            }
+            case "C1": {
+                return "deconz.0.Sensors.8.buttonevent";
+            }
+            case "B1": {
+                return "deconz.0.Sensors.7.buttonevent";
+            }
+            case "A7": {
+                return "deconz.0.Sensors.6.buttonevent";
+            }
+            case "B4.M": {
+                return 'deconz.0.Sensors.3.presence'/*B4 Bewegungsmelder presence*/;
+            }
+            case "No-Name": {
+                return "deconz.0.Sensors.2.buttonevent";
+            }
+        }
+        return null;
+    }
+}
+DeviceDiscovery.initialize();
+
+
 
 (function main():void {
     registerHouseConfig(
         new HouseConfig(
             [
-                new DefaultRoomConfig(Room.Wohnzimmer,
+                new DefaultRoomConfig(
+                    Room.Wohnzimmer,
+                    'Wohnzimmer',
                     5000,
-                    'hue.1.Hue_02.Wohnzimmer.bri',
                     [
-                        {
-                            sensorName: "MotionSensor01",
-                            presensEventObjectId: "deconz.0.Sensors.3.presence"
-                        }
+                        "B4.M"
                     ],
                     [
-                        new DefaultDimmerSwitch(
-                            "Switch WZ Couch",
-                            getDimmerSwitchesByName(),
-                            (context => DefaultDimmerSwitch.getLayout01(context, false, false))
-                        )
+                        "A8",
+                        "A2",
+                        "B1"
+                    ],
+                    []
+                ),
+                new DefaultRoomConfig(
+                    Room.Schlafzimmer,
+                    'Schlafzimmer',
+                    5000,
+                    [
+                        "B4.M"
                     ],
                     [
-                        {
-                            actionName: RoomActionType.tvOn,
-                            action: context => {
-                                // TODO add tv config
-                            }
-                        }
-                    ]
+                        "A7",
+                        "A1",
+                        "C7"
+                    ],
+                    []
+                ),
+                new DefaultRoomConfig(
+                    Room.Flur,
+                    'Flur',
+                    5000,
+                    [
+                        "B4.M"
+                    ],
+                    [
+                        "C6",
+                        "C9",
+                        "A4",
+                        "A6"
+                    ],
+                    []
+                ),
+                new DefaultRoomConfig(
+                    Room.Kueche,
+                    'Kueche',
+                    10 * 60 * 60 * 1000,
+                    [
+                        "B4.M"
+                    ],
+                    [
+                        "C2"
+
+                    ],
+                    []
+                ),
+                new DefaultRoomConfig(
+                    Room.BadGross,
+                    'BadezimmerGross',
+                    5000,
+                    [
+                        "B4.M"
+                    ],
+                    [
+                        "A9",
+                        "C1"
+                    ],
+                    []
+                ),
+                new DefaultRoomConfig(
+                    Room.BadKlein,
+                    'BadezimmerKlein',
+                    5000,
+                    [
+                        "B4.M"
+                    ],
+                    [
+                        "A5"
+                    ],
+                    []
                 )
             ]
         )
