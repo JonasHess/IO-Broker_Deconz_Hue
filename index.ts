@@ -7,8 +7,15 @@ var on = on;
 var getAstroDate = getAstroDate;
 var setTimeout = setTimeout;
 var getObject = getObject;
+var deleteState = deleteState;
+var schedule = schedule;
+var require = require;
 var $ = $;
-//--------------------------------------------
+var Promise = Promise;
+
+
+const wifiradio = require('wifiradio');
+
 
 enum DayTimeMoment {
     /* The strings are used (in combination with the room name) to find scenes from the Phillip's Hue app */
@@ -27,6 +34,61 @@ enum Room {
     BadKlein = "BZK",
 }
 
+
+
+class Radio {
+
+
+    constructor(
+        private ip:string,
+        private pin:string,
+        private mode:number,
+        private volume:number
+    ){}
+
+    private forceTurnOn = function () {
+        return new Promise((resolve, reject) => {
+            let radio = new wifiradio(this.ip, this.pin);
+            radio.setPower(0).then(() => {
+                radio.setPower(1).then(() => {
+                    radio.setPower(0).then(() => {
+                        radio.setPower(1).then(() => {
+                            setTimeout(() => {
+                                resolve();
+                            }, 1000);
+                        }).catch((reason) => {
+                            resolve(reason);
+                        });
+                    });
+                }).catch(function(reason) {
+                    reject(reason);
+                });
+            }).catch(function(reason) {
+                reject(reason);
+            });
+        });
+    };
+
+    public turnRadioOff() {
+        let radio = new wifiradio(this.ip, this.pin);
+        radio.setPower(0);
+    }
+
+    public turnRadioOn() {
+        this.forceTurnOn().then(() => {
+            let radio = new wifiradio(this.ip, this.pin);
+            radio.setMode(this.mode).then(() => {
+                radio.setVolume(this.volume).catch((reason)=> {
+                    console.error(reason);
+                });
+            }).catch((reason) => {
+                console.error(reason);
+            });
+        }).catch(function(reason) {
+            console.error(reason);
+        });;
+    }
+}
 
 
 class TimeOfDay {
@@ -91,43 +153,134 @@ function getDayTimePeriods(): DayTimePeriod[] {
 
 class RoomLock {
     constructor(
-        public lockOwner: string,
         public isManualOverwrite: boolean,
-        public expirationDate: number,
-        public turnOffId: number) {
-    }
+        public expirationDate: number
+    ) {}
 
-    public static setRoomLock(roomName:string, lock:RoomLock) {
-        lock.saveToState(roomName);
-    }
-    public static loadFromState(roomName:string):RoomLock {
-        let obj:any =  JSON.parse(getState(RoomLock.getSatePathOfRoomLock(roomName)).val);
-        return new RoomLock(obj.lockOwner, obj.isManualOverwrite, obj.expirationDate, obj.turnOffId);
-    }
 
     private toJson():string {
         return JSON.stringify(this);
     }
-    public saveToState(roomName: string){
-        let json :string = JSON.stringify(this);
-        setState(RoomLock.getSatePathOfRoomLock(roomName), json);
+
+    public static fromJson(json:string):RoomLock {
+        let obj:any =  JSON.parse(json);
+        return new RoomLock(obj.isManualOverwrite, obj.expirationDate);
     }
 
-    public static createRoomLockStateIfNotExist(roomName:string, callback: () => void):void {
-        const x: RoomLock = new RoomLock("",false,0, 0);
-        createState(RoomLock.getSatePathOfRoomLock(roomName), x.toJson(), callback);
-    }
-
-    public static getSatePathOfRoomLock(roomName:string):string {
-        return  "Sensors.MotionSensors" + "." + roomName;
-    }
-
-    public static amITheRoomLockOwner(roomname:string, myLockName:string):boolean {
-        const state = RoomLock.loadFromState(roomname);
-        if (state.expirationDate < Date.now()) {
-            return true;
+    public static  onMotionSensor(ressource: string, sensorName: string, timeoutMs:number, callback:()=>void) {
+        // Returns true if the light can be switched on
+        if (this.isRessourceLockedByManualOverwrite(ressource)) {
+            this.writeLock(ressource, 0, false, sensorName);
+            return;
         }
-        return (state.lockOwner == myLockName);
+        if (! this.isRessourceLockedBySensor(ressource)) {
+            callback();
+        }
+        let timeOutOnCaseMotionSensorNeverTransmittsNoMotionEvent = 5 * 60 *60 * 1000;
+        this.writeLock(ressource, timeOutOnCaseMotionSensorNeverTransmittsNoMotionEvent , false, sensorName);
+
+    }
+    public static onNoMotionSensor(ressource: string, sensorName: string, timeoutMs:number, callback:()=>void):void {
+
+        if (this.isRessourceLockedByManualOverwrite(ressource)) {
+            this.writeLock(ressource, 0, false, sensorName);
+            return;
+        }
+
+        // unlock the ressource
+        this.writeLock(ressource, (timeoutMs - MotionSensor.minimumNoMotionDelay), false, sensorName);
+
+        console.log("scheduling timout callback for " +timeoutMs );
+        // wait for the timeout:
+        setTimeout(() => {
+            if ( ! this.isRessourceLocked(ressource)) {
+                console.log("Noone else has a lock. Turning off lights.");
+                callback();
+            } else {
+                console.log("Not turning off lights, brcause someone else has a lock");
+            }
+        }, (timeoutMs - MotionSensor.minimumNoMotionDelay));
+    }
+    public static setManualOverwrite(ressource: string, durationInMs: number):void {
+        console.log("locking room " + ressource + " for manual overwrite");
+        this.writeLock(ressource, durationInMs, true);
+    }
+
+    private static isRessourceLocked(ressource: string): boolean {
+        let locks = this.getListOfLocks(ressource);
+        for (let lock of locks) {
+            if (lock.isActive()) {
+                console.log("Room " + ressource + " is locked by someone!");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static isRessourceLockedBySensor(ressource: string):boolean {
+        let locks = this.getListOfLocks(ressource);
+
+        for (let lock of locks) {
+            if (lock.isActive() && !(lock.isManualOverwrite)) {
+                console.log("Room " + ressource + " is locked by another sensor");
+                return true;
+            }
+        }
+        console.log("room " + ressource + " is not locked by another sensor");
+        return false;
+    }
+
+    private static isRessourceLockedByManualOverwrite(ressource: string):boolean {
+        let locks = this.getListOfLocks(ressource);
+        for (let lock of locks) {
+            if (lock.isActive() && lock.isManualOverwrite) {
+                console.log("Room " + ressource + " is locked by manual overwrite");
+                return true;
+            }
+        }
+        console.log("room " + ressource + " is not locked by manual overwrite");
+        return false;
+    }
+
+    private isActive():boolean {
+        return this.expirationDate > Date.now();
+    }
+
+
+// Delete States
+    public static deleteStates():void{
+        $(RoomLock.getGenericObjectId("*", "*")).each(function (id) {
+            console.log("Deleting state for: " + id);
+            deleteState(id);
+        });
+    }
+
+    private static  writeLock(ressource: string, duration:number, isManualOverwrite: boolean, sensorName?:string):void {
+        let json  = new RoomLock(isManualOverwrite, Date.now() + duration).toJson();
+        let objectId: string = this.getObjectId(ressource, isManualOverwrite, sensorName);
+        createState(objectId, json, true);
+    }
+
+    private static getListOfLocks(ressource):RoomLock[] {
+        let resultList = [];
+
+        let ids:string[] = $("[id=" + "*" + this.getGenericObjectId(ressource, "*") + "]");
+
+        for (let id of ids) {
+            let json = getState(id).val;
+            let lock = this.fromJson(json);
+            resultList.push(lock);
+        }
+
+        return resultList;
+    }
+
+    private static getGenericObjectId(ressource: string, lockName) {
+        return  "RessourceLock." + ressource + "." + lockName;
+    }
+
+    private static getObjectId(ressource: string, isManualOverwrite: boolean, sensorName?:string) {
+        return this.getGenericObjectId(ressource, (isManualOverwrite ? "manual" : sensorName));
     }
 }
 
@@ -196,12 +349,8 @@ function registerHueDimmerButtonEvents(context:ActionContext, dimmerName:string,
                         const room: string = motionSensorOverwrites[i].room;
                         const durationInMs: number = motionSensorOverwrites[i].durationInMs;
                         let lockedUntil = Date.now() + durationInMs;
-
-                        RoomLock.createRoomLockStateIfNotExist(room, () => {
-                            let lock = new RoomLock(dimmerName, true, lockedUntil , 0);
-                            lock.saveToState(room);
-                            console.log("Setting motionSensorOverwrites for room " + room + " duration: " + durationInMs);
-                        })
+                        console.log("Setting motionSensorOverwrites for room " + room + " duration: " + durationInMs);
+                        RoomLock.setManualOverwrite(room, durationInMs);
                     }
                 } else {
                     console.log("no motionSensorOverwrites found!");
@@ -214,63 +363,32 @@ function registerHueDimmerButtonEvents(context:ActionContext, dimmerName:string,
 
 function registerHueSensorMotionEvent(sensorId: string, lockname: string, roomname: string, noMationAfterDelayInMsec: number, motionActions: MotionSensorActionBook) {
     on({id: sensorId, change: "ne"}, function (obj) {
-        RoomLock.createRoomLockStateIfNotExist(roomname, () => {
-            const motionDetected = obj.state.val;
-            const oldValue = obj.oldState.val;
+        const motionDetected = obj.state.val;
 
-            console.log(lockname + " Event incoming,  motionDetected: " + motionDetected);
+        console.log(lockname + " Event incoming,  motionDetected: " + motionDetected);
 
-            const timeOfDayMotionAction = getMotionActionMatchingTimeOfDay(motionActions);
-            if (timeOfDayMotionAction == null) {
-                console.log(lockname + " No motionAction found for this time of day");
-                return;
-            }
-            const onMotionAction:()=>void = timeOfDayMotionAction.action;
-            const onNoMotionAction:()=>void = motionActions.onNoMoreMotionAction;
+        let onMotionAction:()=>void = null
+        const timeOfDayMotionAction = getMotionActionMatchingTimeOfDay(motionActions);
+        if (timeOfDayMotionAction == null && motionDetected) {
+            console.log(lockname + " No motionAction found for this time of day");
+            return;
+        } else {
+            onMotionAction = timeOfDayMotionAction.action;
+        }
 
-            if (RoomLock.amITheRoomLockOwner(roomname, lockname)) {
-                console.log(lockname + " is the lock owner");
-                if (motionDetected) {
-                    console.log(lockname + " executing motion action");
-                    RoomLock.setRoomLock(roomname, new RoomLock(lockname, false, 3*60*60*1000, 0));
-                    onMotionAction();
-                    return;
-                } else {
-                    if (RoomLock.loadFromState(roomname).isManualOverwrite) {
-                        console.log(lockname + " Ignoring noMotion event because of old manual overwrite");
-                        return;
-                    }
-                    const turnOffId = Date.now();
-                    console.log(lockname + " No more motion! setting up delay...");
-                    RoomLock.setRoomLock(roomname, new RoomLock(lockname, false, noMationAfterDelayInMsec, turnOffId));
-                    setTimeout(()=> {
-                        if (! RoomLock.amITheRoomLockOwner(roomname, lockname)) {
-                            console.log(lockname + " Delayed:  not the lock owner");
-                            return;
-                        }
-                        if (RoomLock.loadFromState(roomname).turnOffId !== turnOffId) {
-                            console.log(lockname + " Delayed:  incorrect turnOffId");
-                            return;
-                        }
-                        console.log(lockname + " Delayed:  executing noMotionAction");
-                        RoomLock.setRoomLock(roomname, new RoomLock( lockname, false, 0, 0)); // Remove the lock
-                        onNoMotionAction();
-                    }, noMationAfterDelayInMsec);
-                }
-            } else {
-                console.log(lockname + " is not the lock owner");
-                if (RoomLock.loadFromState(roomname).isManualOverwrite) {
-                    console.log(lockname + " Room is locked by manual overwrite");
-                } else {
-                    console.log(lockname + " is not locked by manual overwrite");
-                    if (motionDetected) {
-                        RoomLock.setRoomLock(roomname, new RoomLock( lockname, false, 3*60*60*1000, 0));
-                        onMotionAction();
-                        console.log(lockname + " Taking over existing lock");
-                    }
-                }
-            }
-        });
+        const onNoMotionAction:()=>void = motionActions.onNoMoreMotionAction;
+
+        if (motionDetected) {
+            RoomLock.onMotionSensor(roomname, lockname, noMationAfterDelayInMsec, () => {
+                console.log("calling ON callback");
+                onMotionAction();
+            });
+        } else {
+            RoomLock.onNoMotionSensor(roomname, lockname, noMationAfterDelayInMsec, () => {
+                console.log("calling OFF callback!");
+                onNoMotionAction();
+            });
+        }
     });
 }
 
@@ -298,7 +416,6 @@ function getCurrentDayTimePeriodId():DayTimeMoment {
     for (let i = 0; i < dayTimePeriods.length; i++) {
         const p = dayTimePeriods[i];
         if (currentTime.isBefore(p.startsAt)) {
-            console.log("Current DayTimeId= " + lastP.id);
             return lastP.id;
         }
         lastP = p;
@@ -319,6 +436,8 @@ function registerHueSensorCoupleMotionEvents(room, noMotionDelay, sensors: Motio
 
 
 class MotionSensor {
+    public static  minimumNoMotionDelay: number = 14 * 1000;
+
     constructor (
         public sensorName:string,
         public presensEventObjectId:string
@@ -380,8 +499,6 @@ class DimmerSwitchButtonEventActions {
         return HueDimmerButtonEvents[HueDimmerButtonEvents[this.eventId]];
     }
 
-
-
 }
 enum HueDimmerButtonEvents {
     ON_BUTTON_DOWN = 1000,
@@ -403,8 +520,11 @@ enum HueDimmerButtonEvents {
 
 class RoomConfig {
 
+
+
     constructor(
         public roomname: Room,
+        public radios:Radio[],
         public noMotionDelay: number,
         public hueRoomBrightnessObjectId,
         public hueScenes: HueScene[],
@@ -413,7 +533,15 @@ class RoomConfig {
         public dimmerSwitches: DimmerSwitch[],
         public defaultRoomActionsProvider: RoomAction[],
         public roomActions: RoomAction[]
-    ){}
+    ){
+        if (noMotionDelay < MotionSensor.minimumNoMotionDelay) {
+            console.error("The NoMotionDelay must be larger " +
+                "than 14 sec, as this is the minimum delay the " +
+                "Hue Motion sensor needs to detect the absense " +
+                "of motion");
+            this.noMotionDelay = MotionSensor.minimumNoMotionDelay;
+        }
+    }
 
     public runRoomActionOfType(actionType: RoomActionType, context: ActionContext):void {
         this.getRoomActionsOfType(actionType, (x) => {
@@ -439,10 +567,10 @@ class RoomConfig {
             result = findInArray(this.defaultRoomActionsProvider, actionType);
         }
 
-        console.log("result: " + result);
         if (result !== null) {
-            console.log("Action was found -- calling callback");
             callback(result);
+        } else {
+            console.warn("No action " + actionType + " found in room " + this.roomname);
         }
         return result;
     }
@@ -456,8 +584,11 @@ class HouseConfig {
 
     public turnHouseOff(context: ActionContext) {
         for (let roomConfig of this.roomConfigs) {
-            context.roomConfig.runRoomActionOfType(RoomActionType.roomOff, context);
+            let contextClone = context.clone();
+            contextClone.roomConfig = roomConfig;
+            roomConfig.runRoomActionOfType(RoomActionType.roomOff, contextClone );
         }
+        RoomLock.deleteStates()
     }
 }
 
@@ -470,6 +601,18 @@ class ActionContext {
         public sceneIndex?:number,
         public dayTime?:DayTimeMoment
     ){}
+
+    public clone():ActionContext {
+        return new ActionContext(
+            this.houseConfig,
+            this.roomConfig,
+            this.initiator,
+            this.brightness,
+            this.sceneIndex,
+            this.dayTime
+        );
+    }
+
 }
 
 class DimmerSwitch {
@@ -490,24 +633,24 @@ class RoomAction {
 }
 
 enum RoomActionType {
-    activateScene,
-    regulateBrightnes,
-    onMotion,
-    onNoMotion,
-    musicOn,
-    musicOff,
-    musicNext,
-    musicPrevious,
-    musicVolumeUp,
-    musicVolumeDown,
-    ventilationOn,
-    ventilationOff,
-    tvOn,
-    tvOff,
-    tvVolumeUp,
-    tvVolumeDown,
-    turnLightsOff,
-    roomOff
+    activateScene = "activateScene",
+    regulateBrightnes = "regulateBrightnes",
+    onMotion = "onMotion",
+    onNoMotion = "onNoMotion",
+    musicOn = "music on",
+    musicOff = "music off",
+    musicNext = "musicNext",
+    musicPrevious = "musicPrevious",
+    musicVolumeUp = "musicVolumeUp",
+    musicVolumeDown = "musicVolumeDown",
+    ventilationOn = "ventilationOn",
+    ventilationOff = "ventilationOff",
+    tvOn = "tvOn",
+    tvOff = "tvOff",
+    tvVolumeUp = "tvVolumeUp",
+    tvVolumeDown = "tvVolumeDown",
+    turnLightsOff = "tvVolumeDown",
+    roomOff = "roomOff"
 }
 
 function getDefaultRoomActions():RoomAction[] {
@@ -537,21 +680,22 @@ function getDefaultRoomActions():RoomAction[] {
                 let scenes = context.roomConfig.hueScenes;
 
                 if ((scenes.length  == 0))  {
-                    console.error("No scenes defined for room " + context.roomConfig.roomname);
+                    console.warn("No scenes defined for room " + context.roomConfig.roomname);
                     return;
                 }
                 let wantedSceneIndex = context.sceneIndex % scenes.length; //TODO off by one?
-                context.sceneIndex = wantedSceneIndex;
-                console.log("activating scene index: " + wantedSceneIndex);
-                scenes[wantedSceneIndex].activateScene(context);
+                let contextClone = context.clone();
+                contextClone.sceneIndex = wantedSceneIndex;
+                scenes[wantedSceneIndex].activateScene(contextClone);
             }
         },
         {
             actionName: RoomActionType.turnLightsOff,
             action: context => {
-                context.brightness = 0;
+                let contextClone = context.clone();
+                contextClone.brightness = 0;
 
-                context.roomConfig.runRoomActionOfType(RoomActionType.regulateBrightnes, context);
+                contextClone.roomConfig.runRoomActionOfType(RoomActionType.regulateBrightnes, contextClone);
 
             }
         },
@@ -560,6 +704,22 @@ function getDefaultRoomActions():RoomAction[] {
             action: context => {
                 context.roomConfig.runRoomActionOfType(RoomActionType.turnLightsOff, context);
                 context.roomConfig.runRoomActionOfType(RoomActionType.musicOff, context);
+            }
+        },
+        {
+            actionName: RoomActionType.musicOn,
+            action: context => {
+                for (let radio of context.roomConfig.radios) {
+                    radio.turnRadioOn();
+                }
+            }
+        },
+        {
+            actionName: RoomActionType.musicOff,
+            action: context => {
+                for (let radio of context.roomConfig.radios) {
+                    radio.turnRadioOff();
+                }
             }
         },
         {
@@ -593,31 +753,41 @@ abstract class AutoWiredHueScene extends HueScene{
         super(action);
     }
 
-    protected getHueSceneObjectIds(room: Room, sceneName: string, callBack:(id, index)=>any) {
+    protected getHueSceneObjectIds(room: Room, sceneName: string):string {
         const sceneNamespace = "javascript.0.PhilipsHue.Scenes";
 
         let roomName:string = room;
-        let searchname = sceneNamespace + "." + roomName + "." + sceneName;
-        console.log("searching for name " + searchname );
+        let searchname = sceneNamespace + "." + roomName + "." + sceneName + "*";
+        let ids = $("[id=" + searchname + ".*]");
 
-        let cacheSelectorallefalse = $("[id=" + searchname + ".*]");
-        cacheSelectorallefalse.each(callBack);
+        if (ids.length == 0) {
+            console.warn("Scene not found: " + searchname);
+            return null;
+        }
+        console.log("Scenes found for " + searchname + ": " + ids.length);
+        // random element of found ids.
+        return ids[Math.floor(Math.random()*ids.length)];
     }
 }
 
 class AutowiredButtonHueScene extends AutoWiredHueScene{
     constructor(){
         super((context: ActionContext) => {
-            this.getHueSceneObjectIdsSceneIndex(context.roomConfig.roomname, context.sceneIndex, (id, index)=> {
-                console.log("Activating scene:" + id);
-                setState(id, true);
-            });
+            let id = this.getHueSceneObjectIdsSceneIndex(context.roomConfig.roomname, context.sceneIndex);
+            if (id !== null) {
+                if( id.toLowerCase().indexOf('off') < 0){
+                    setState(id, true);
+                }
+            }
+            if( id.toLowerCase().indexOf('radio') >= 0){
+                context.roomConfig.runRoomActionOfType(RoomActionType.musicOn, context);
+            }
         });
     }
 
-    private getHueSceneObjectIdsSceneIndex(room: Room, sceneIndex:number, callBack:(id, index)=>any) {
+    private getHueSceneObjectIdsSceneIndex(room: Room, sceneIndex:number):string {
         let sceneName:string =  "" + (sceneIndex + 1);
-        this.getHueSceneObjectIds(room, sceneName, callBack);
+        return this.getHueSceneObjectIds(room, sceneName);
     }
 }
 
@@ -627,14 +797,20 @@ class AutowiredMotionScene extends AutoWiredHueScene{
     constructor(
     ){
         super((context: ActionContext) => {
-            this.getHueSceneObjectIdsDayTime(context.roomConfig.roomname, context.dayTime, (id:number, index:number)=> {
-                setState(id, true);
-            });
+            let id = this.getHueSceneObjectIdsDayTime(context.roomConfig.roomname, context.dayTime);
+            if (id !== null) {
+                if( id.toLowerCase().indexOf('off') < 0){
+                    setState(id, true);
+                }
+            }
+            if( id.toLowerCase().indexOf('radio') >= 0){
+                context.roomConfig.runRoomActionOfType(RoomActionType.musicOn, context);
+            }
         });
     }
-    private getHueSceneObjectIdsDayTime(room: Room, dayTimeMoment:DayTimeMoment, callBack:(id, index)=>any) {
+    private getHueSceneObjectIdsDayTime(room: Room, dayTimeMoment:DayTimeMoment):string {
         let sceneName:string =  dayTimeMoment;
-        this.getHueSceneObjectIds(room, sceneName, callBack);
+        return this.getHueSceneObjectIds(room, sceneName);
     }
 }
 
@@ -667,9 +843,10 @@ function registerHouseConfig(houseConfig: HouseConfig) {
                             sensorActions.push(new DayTimeMotionSensorAction(
                                 motionScene.dayTime,
                                 () => {
-                                    context.dayTime = motionScene.dayTime;
-                                    context.sceneIndex = i;
-                                    roomConfig.runRoomActionOfType(RoomActionType.onMotion, context);
+                                    let contextClone = context.clone();
+                                    contextClone.dayTime = motionScene.dayTime;
+                                    contextClone.sceneIndex = i;
+                                    roomConfig.runRoomActionOfType(RoomActionType.onMotion, contextClone);
                                 }
                             ))
                         }
@@ -732,20 +909,22 @@ class DefaultRoomConfig extends RoomConfig{
 
     constructor(
         roomname: Room,
+        radios:Radio[],
         roomNameInHueApp,
         noMotionDelay: number,
         motionSensors: string[],
-        dimmerSwitches: string[],
+        dimmerSwitches: DimmerSwitch[],
         roomActions: RoomAction[]
     ) {
         super(
             roomname,
+            radios,
             noMotionDelay,
             "hue.1.Hue_02." + roomNameInHueApp + ".bri",
             getDefaultHueScenes(),
             getDefaultMotionSceneConfigs(),
             DefaultHueMotionScensor.fromList(motionSensors),
-            DefaultDimmerSwitch.fromList(dimmerSwitches),
+            dimmerSwitches,
             (()=>{ return getDefaultRoomActions()})(),
             roomActions
         );
@@ -756,10 +935,10 @@ class DefaultDimmerSwitch extends DimmerSwitch{
 
     constructor(
         switchName: string,
-        getButtonLayout: (context: ActionContext) => DimmerSwitchLayout = (context => DefaultDimmerSwitch.getLayout01(context, false, false))) {
+        getButtonLayout: (context: ActionContext) => DimmerSwitchLayout = (context => DefaultDimmerSwitch.getLayout01(context, false, false,false))) {
         super(
             switchName,
-            getObjectIdByName(switchName),
+            DeviceDiscovery.getObjectIdByName(switchName),
             getButtonLayout);
     }
 
@@ -771,7 +950,7 @@ class DefaultDimmerSwitch extends DimmerSwitch{
         return result;
     }
 
-    public static getLayout01(context:ActionContext, offButtonTurnsEntireRoomOff:boolean,  longOffButtonTurnsHouseOff: boolean):DimmerSwitchLayout {
+    public static getLayout01(context:ActionContext, offButtonTurnsEntireRoomOff:boolean,  offButtonTurnsEntireHouseOff:boolean, longOffButtonTurnsHouseOff: boolean):DimmerSwitchLayout {
         let motionSensorOverwrite = (duration:number ) => {
             return  [
                 new RoomLockOverwriteInfo(context.roomConfig.roomname, duration)
@@ -784,8 +963,9 @@ class DefaultDimmerSwitch extends DimmerSwitch{
                 motionSensorOverwrite(defaultOverwrite),
                 (context) => {
                     console.log("Setting brightness to " + brightness);
-                    context.brightness = brightness;
-                    context.roomConfig.runRoomActionOfType(RoomActionType.regulateBrightnes, context);
+                    let contextClone = context.clone();
+                    contextClone.brightness = brightness;
+                    contextClone.roomConfig.runRoomActionOfType(RoomActionType.regulateBrightnes, contextClone);
                 }
             )
         };
@@ -800,14 +980,23 @@ class DefaultDimmerSwitch extends DimmerSwitch{
                             motionSensorOverwrite(defaultOverwrite),
                             (context) => {
                                 console.log("Turning lights on");
-                                context.sceneIndex = i;
-                                context.roomConfig.runRoomActionOfType(RoomActionType.activateScene, context);
+                                let contextClone = context.clone();
+                                contextClone.sceneIndex = i;
+                                contextClone.roomConfig.runRoomActionOfType(RoomActionType.activateScene, contextClone);
                             }
                         )
                     );
                 }
                 return x;
             })()),
+            new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.ON_BUTTON_LONG, [
+                new ButtonAction(
+                    [],
+                    (context) => {
+                        setState("javascript.0.PhilipsHue.Scenes.Resync", true);
+                    }
+                )
+            ]),
             new DimmerSwitchButtonEventActions(HueDimmerButtonEvents.DARKER_BUTTON_DOWN, [
                 setBrightness(125),
                 setBrightness(100),
@@ -852,7 +1041,10 @@ class DefaultDimmerSwitch extends DimmerSwitch{
                     (context) => {
                         if (offButtonTurnsEntireRoomOff) {
                             context.roomConfig.runRoomActionOfType(RoomActionType.roomOff, context);
-                        } else {
+                        } else if (offButtonTurnsEntireHouseOff) {
+                            context.houseConfig.turnHouseOff(context);
+                        }
+                        else {
                             context.roomConfig.runRoomActionOfType(RoomActionType.turnLightsOff, context);
                         }
                     }
@@ -895,7 +1087,7 @@ class DefaultHueMotionScensor extends MotionSensor{
     ) {
         super(
             sensorName,
-            getObjectIdByName(sensorName));
+            DeviceDiscovery.getObjectIdByName(sensorName));
     }
 
     public static fromList(list:string[]) {
@@ -916,18 +1108,26 @@ class DeviceDiscovery {
         DeviceDiscovery.discoverDevices(
             DeviceDiscovery.devices,
             "deconz.0.Sensors.*.presence",
-            "-M"
+            ".M"
         );
+
+        DeviceDiscovery.discoverDevices(
+            DeviceDiscovery.devices,
+            "deconz.0.Sensors.*.buttonevent",
+            ""
+        );
+
+        console.log("Discovered devices: " + JSON.stringify(this.devices));
     }
 
     private static  discoverDevices (returnObject: any ,searchString: string, suffix:string) {
         let t = "[id=" + searchString + "]";
         let discoveredIds:any = $(t);
-        for (var id of discoveredIds) {
+        for (let id of discoveredIds) {
             if (! (id)) {
                 continue;
             }
-            var obj = getObject(id);
+            let obj = getObject(id);
             if (! (obj)) {
                 continue;
             }
@@ -936,11 +1136,11 @@ class DeviceDiscovery {
             if (! (commonName)) {
                 continue;
             }
-            let s = commonName.split(" ", 2);
+            var s = commonName.split(" ", 2);
             if (s.length < 1) {
                 continue;
             }
-            returnObject[s[0] + suffix] = id;
+            returnObject["" + s[0] + suffix] = id;
         }
         return returnObject;
     }
@@ -950,6 +1150,7 @@ class DeviceDiscovery {
         if (result) {
             return result;
         }
+        /*
         switch (name) {
             case "A8": {
                 return "deconz.0.Sensors.20.buttonevent";
@@ -997,17 +1198,17 @@ class DeviceDiscovery {
                 return "deconz.0.Sensors.6.buttonevent";
             }
             case "B4.M": {
-                return 'deconz.0.Sensors.3.presence'/*B4 Bewegungsmelder presence*/;
+                return 'deconz.0.Sensors.3.presence';
             }
             case "No-Name": {
                 return "deconz.0.Sensors.2.buttonevent";
             }
         }
+        */
         return null;
     }
 }
 DeviceDiscovery.initialize();
-
 
 
 (function main():void {
@@ -1016,83 +1217,139 @@ DeviceDiscovery.initialize();
             [
                 new DefaultRoomConfig(
                     Room.Wohnzimmer,
+                    [],
                     'Wohnzimmer',
-                    5000,
+                    2 * 60 * 1000,
                     [
                         "B4.M"
                     ],
-                    [
-                        "A8",
-                        "A2",
-                        "B1"
-                    ],
+                    DefaultDimmerSwitch.fromList(
+                        [
+                            "A8",
+                            "A2",
+                            "B1",
+                            "C8"
+                        ]
+                    ),
                     []
                 ),
                 new DefaultRoomConfig(
                     Room.Schlafzimmer,
+                    [],
                     'Schlafzimmer',
-                    5000,
+                    3 * 60 * 1000,
                     [
-                        "B4.M"
+                      //  "B6.M"
                     ],
-                    [
-                        "A7",
-                        "A1",
-                        "C7"
-                    ],
+                    DefaultDimmerSwitch.fromList(
+                        [
+                            "A7",
+                            "A1",
+                            "C7"
+                        ]
+                    ),
                     []
                 ),
                 new DefaultRoomConfig(
                     Room.Flur,
+                    [],
                     'Flur',
-                    5000,
+                    2 * 60 * 1000,
                     [
-                        "B4.M"
+                        "B8.M",
+                        "B7.M"
                     ],
-                    [
-                        "C6",
-                        "C9",
-                        "A4",
-                        "A6"
-                    ],
+                    (()=>{
+                        let array = DefaultDimmerSwitch.fromList(
+                            [
+                                "C6",
+                                "A4",
+                                "A6"
+                            ]
+                        );
+                        array.push(new DefaultDimmerSwitch(
+                                "C9",
+                                (context => DefaultDimmerSwitch.getLayout01(context, false, true,false))
+                            )
+                        );
+                        return array;
+                    })(),
                     []
                 ),
                 new DefaultRoomConfig(
                     Room.Kueche,
+                        [
+                            new Radio("10.0.0.10", "1234", 3, 15)
+                        ],
                     'Kueche',
-                    10 * 60 * 60 * 1000,
+                    5 * 60 * 1000,
                     [
-                        "B4.M"
+                       "B9.M",
+                       "B5.M"
                     ],
-                    [
-                        "C2"
+                    (()=>{
+                        let array = DefaultDimmerSwitch.fromList(
+                            []
+                        );
+                        array.push(new DefaultDimmerSwitch(
+                            "A3",
+                            (context => DefaultDimmerSwitch.getLayout01(context, true, false,false))
+                            )
+                        );
 
-                    ],
+                        return array;
+                    })(),
                     []
                 ),
                 new DefaultRoomConfig(
                     Room.BadGross,
+                    [
+                        new Radio("10.0.0.13", "1234", 3, 15)
+                    ],
                     'BadezimmerGross',
-                    5000,
+                    7 * 60 * 1000,
                     [
-                        "B4.M"
+                        "B2.M"
                     ],
-                    [
-                        "A9",
-                        "C1"
-                    ],
+                    (()=>{
+                        let array = DefaultDimmerSwitch.fromList(
+                            []
+                        );
+                        array.push(new DefaultDimmerSwitch(
+                            "A9",
+                            (context => DefaultDimmerSwitch.getLayout01(context, true, false,false))
+                            )
+                        );
+                        array.push(new DefaultDimmerSwitch(
+                            "A6",
+                            (context => DefaultDimmerSwitch.getLayout01(context, true, false,false))
+                            )
+                        );
+                        return array;
+                    })(),
                     []
                 ),
                 new DefaultRoomConfig(
                     Room.BadKlein,
+                    [
+                        new Radio("10.0.0.40", "1234", 0, 15)
+                    ],
                     'BadezimmerKlein',
-                    5000,
+                    4 * 60 * 1000,
                     [
-                        "B4.M"
+                        "B3.M"
                     ],
-                    [
-                        "A5"
-                    ],
+                    (()=>{
+                        let array = DefaultDimmerSwitch.fromList(
+                            []
+                        );
+                        array.push(new DefaultDimmerSwitch(
+                            "C2",
+                            (context => DefaultDimmerSwitch.getLayout01(context, true, false,false))
+                            )
+                        );
+                        return array;
+                    })(),
                     []
                 )
             ]
